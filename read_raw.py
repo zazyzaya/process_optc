@@ -440,11 +440,41 @@ def copy_one(in_f, node_map, lock, i, tot):
 
     prog.close()
 
+def compress(): 
+    def compress_one(fid): 
+        try: 
+            in_f = open(f'flow_split/{fid}.csv', 'r') 
+        except FileNotFoundError: 
+            return 
+        
+        line = in_f.readline()
+
+        uq = set()
+        while line: 
+            _,src,sp,dst,dp,_ = line.split(',')
+            if int(sp) > int(dp): 
+                uq.add((src,dp,dst))
+            else: 
+                uq.add((dst,sp,src))
+
+            line = in_f.readline() 
+
+        in_f.close()
+
+        out_f = open(f'flow_split_uq/{fid}.csv', 'w+')
+        for (src,port,dst) in uq: 
+            out_f.write(f'{src},{port},{dst}\n')
+        out_f.close()
+
+    Parallel(n_jobs=64, prefer='processes')(
+        delayed(compress_one)(i) for i in tqdm(range(158))
+    )
 
 if __name__ == '__main__':
     #build_maps()
     #build_maps(fold=TEST)
-    split_all('flow_split/nmap.pkl')
+    #split_all('flow_split/nmap.pkl')
+    compress()
 
     '''
     # Testing
