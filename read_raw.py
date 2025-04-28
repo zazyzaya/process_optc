@@ -22,7 +22,8 @@ FIRST_TS = 1568676405.62800
 LAST_TS  = 1569436694.309
 F_DELTA = 100 # Num snapshots per file
 SNAPSHOT_SIZE = 60*60 # seconds
-MAX_BUFFER = 2**16 # Max lines workers store before flushing out
+MAX_BUFFER = 2**10 # Max lines workers store before flushing out
+
 
 get_ts = lambda x : parser.parse(x).timestamp()
 get_snapshot = lambda x : (x - FIRST_TS) // SNAPSHOT_SIZE
@@ -34,8 +35,23 @@ def host_to_idx(x):
     else:
         return 1000 + int(x[2:])
 
-def label_line(src,dst,ts):
-    return 0 # TODO
+def get_labels(): 
+    f = open('labels.csv', 'r')
+    line = f.readline() # Skip header
+    line = f.readline() 
+
+    red = set()
+    while line: 
+        tokens = line.split(',')
+        if tokens[-2] == 'FLOW': 
+            red.add(tokens[1]) # ID
+
+        line = f.readline()
+
+    f.close()
+    return red 
+
+MALICIOUS_EVENTS = get_labels()
 
 
 def ignore(ip):
@@ -176,11 +192,15 @@ def build_maps(out_f='flow_split/nmap.pkl'):
         pickle.dump(out_map, f)
 
 
-def split_all(nmap_f, fold=TRAIN):
-    files = glob.glob(RAW_OPTC+fold+'**/*.gz')
+def split_all(nmap_f):
+    b_files = glob.glob(RAW_OPTC+'/benign_gz/**/*.gz')
+    m_files = glob.glob(RAW_OPTC+'/eval_gz/**/*.gz')
     
     # So processes aren't all touching the same files at the same time 
-    random.shuffle(files)
+    random.shuffle(b_files)
+    random.shuffle(m_files)
+
+    files = m_files + b_files
     
     print(len(files))
     print(files[0])
@@ -196,7 +216,7 @@ def split_all(nmap_f, fold=TRAIN):
             node_map[k] = v.pop()
 
     with Manager() as manager:
-        p = Pool(processes=64)
+        p = Pool(processes=128)
         lock = manager.Lock()
 
         #f = '/mnt/raid1_ssd_4tb/datasets/OpTC/ecar/eval_gz/23Sep19/AIA-201-225.ecar-last.json.gz'
@@ -215,6 +235,105 @@ def split_all(nmap_f, fold=TRAIN):
 
         p.close()
         p.join()
+
+
+def copy_one(in_f, node_map, lock, i, tot):
+    in_f = gzip.open(in_f)
+
+    line = in_f.readline()
+    prog = tqdm(desc='%d/%d' % (i+1, tot))
+
+    buffer = None
+    io_buffer = defaultdict(str)
+    buffer_contents = 0
+    
+    # Only care about internal traffic 
+    while line:
+        datum = json.loads(line)
+
+        if datum['object'] == 'FLOW' and datum['action'] == 'START':
+            props = datum['properties']
+
+            label = 0 
+            if datum['id'] in MALICIOUS_EVENTS: 
+                label = 1 
+
+            # Edge features
+            src_port = int(props.get('src_port',9999))
+            dst_port = int(props.get('dest_port',9999))
+            img = props.get('image_path', '').split("\\")[-1]
+            usr = datum['principal'].split('\\')[-1]
+            is_tcp = props.get('l4protocol') == '6'
+
+            if not is_tcp or usr.lower() == 'system': #) or (src_port > 1024 and dst_port > 1024): 
+                line = in_f.readline()
+                prog.update()
+                continue 
+
+            src_ip = props['src_ip']
+            dst_ip = props['dest_ip']
+            host = datum['hostname']
+
+            def check_hostname(ip): 
+                host = node_map.get(ip)
+                if host is None:
+                    # Only care about internal traffic  
+                    if ip.startswith('142'): 
+                        return ip
+                    return None 
+                
+                return host 
+
+            if props['direction'] == 'inbound':
+                src = check_hostname(src_ip)
+                dst = host
+            elif props['direction'] == 'outbound':
+                src = host
+                dst = check_hostname(dst_ip)
+
+            # Only log if we can attribute src and dst hosts
+            if src and dst: 
+                ts = get_ts(datum['timestamp'])
+
+                #src = host_to_idx(src)
+                #dst = host_to_idx(dst)
+                snapshot = get_snapshot(ts)
+
+                # Log anytime a malicious event is captured (just bc I'm curious)
+                if label: 
+                    print(f'{ts},{src},{src_port},{dst},{dst_port},{usr},{img},{label}\n')
+
+                io_buffer[snapshot] += f'{ts},{src},{src_port},{dst},{dst_port},{usr},{img},{label}\n'
+                buffer_contents += 1
+
+                # Try to minimize syncrhonization
+                if buffer_contents > MAX_BUFFER:
+                    for f_num,out_str in io_buffer.items():
+                        fname = SPLIT+str(int(f_num)) + '.csv'
+
+                        with lock:
+                            out_f = open(fname, 'a+')
+                            out_f.write(out_str)
+                            out_f.close()
+
+                    # Empty buffer
+                    io_buffer = defaultdict(str)
+                    buffer_contents = 0
+
+
+        line = in_f.readline()
+        prog.update()
+
+    # Write before returning regardless of buffer len
+    for f_num,out_str in io_buffer.items():
+        fname = SPLIT+str(int(f_num)) + '.csv'
+
+        with lock:
+            out_f = open(fname, 'a+')
+            out_f.write(out_str)
+            out_f.close()
+
+    prog.close()
 
 
 def copy_one_nethawk(in_f, node_map, lock, i, tot):
@@ -353,93 +472,6 @@ def copy_one_nethawk(in_f, node_map, lock, i, tot):
 
     prog.close()
 
-def copy_one(in_f, node_map, lock, i, tot):
-    in_f = gzip.open(in_f)
-
-    line = in_f.readline()
-    prog = tqdm(desc='%d/%d' % (i+1, tot))
-
-    buffer = None
-    io_buffer = defaultdict(str)
-    buffer_contents = 0
-    
-    # Only care about internal traffic 
-    ignore = [443, 80]
-    while line:
-        datum = json.loads(line)
-
-        if datum['object'] == 'FLOW' and datum['action'] == 'START':
-            props = datum['properties']
-
-            # Edge features
-            src_port = int(props.get('src_port',9999))
-            dst_port = int(props.get('dest_port',9999))
-            is_tcp = props.get('l4protocol') == '6'
-
-            if (not is_tcp) or (src_port > 1024 and dst_port > 1024) or (src_port in ignore or dst_port in ignore): 
-                line = in_f.readline()
-                prog.update()
-                continue 
-
-            src_ip = props['src_ip']
-            dst_ip = props['dest_ip']
-            host = datum['hostname']
-
-            usr = datum['principal'].split('\\')[-1]
-
-            def check_hostname(ip): 
-                host = node_map.get(ip)
-                if host is None: 
-                    return ip 
-                
-                return host 
-
-            if props['direction'] == 'inbound':
-                src = check_hostname(src_ip)
-                dst = host
-            elif props['direction'] == 'outbound':
-                src = host
-                dst = check_hostname(dst_ip)
-
-            # Only log if we can attribute src and dst hosts
-            if src and dst: 
-                ts = get_ts(datum['timestamp'])
-
-                #src = host_to_idx(src)
-                #dst = host_to_idx(dst)
-                snapshot = get_snapshot(ts)
-
-                io_buffer[snapshot] += f'{ts},{src},{src_port},{dst},{dst_port},{usr}\n'
-                buffer_contents += 1
-
-                # Try to minimize syncrhonization
-                if buffer_contents > MAX_BUFFER:
-                    for f_num,out_str in io_buffer.items():
-                        fname = SPLIT+str(int(f_num)) + '.csv'
-
-                        with lock:
-                            out_f = open(fname, 'a+')
-                            out_f.write(out_str)
-                            out_f.close()
-
-                    # Empty buffer
-                    io_buffer = defaultdict(str)
-                    buffer_contents = 0
-
-        line = in_f.readline()
-        prog.update()
-
-    # Write before returning regardless of buffer len
-    for f_num,out_str in io_buffer.items():
-        fname = SPLIT+str(int(f_num)) + '.csv'
-
-        with lock:
-            out_f = open(fname, 'a+')
-            out_f.write(out_str)
-            out_f.close()
-
-    prog.close()
-
 def compress(): 
     def compress_one(fid): 
         try: 
@@ -449,25 +481,28 @@ def compress():
         
         line = in_f.readline()
 
-        uq = set()
+        uq = defaultdict(lambda : [float('inf'), float('-inf'), 0])
         while line: 
-            _,src,sp,dst,dp,_ = line.split(',')
+            ts,src,sp,dst,dp,usr,img,label = line.split(',')
             if int(sp) > int(dp): 
-                uq.add((src,dp,dst))
+                k = (src,dp,usr,img,dst)
             else: 
-                uq.add((dst,sp,src))
+                k = (dst,sp,usr,img,src)
 
+            uq[k][0] = min(uq[k][0], float(ts))
+            uq[k][1] = max(uq[k][1], float(ts))
+            uq[k][2] = max(uq[k][2], int(label))
             line = in_f.readline() 
 
         in_f.close()
 
         out_f = open(f'flow_split_uq/{fid}.csv', 'w+')
-        for (src,port,dst) in uq: 
-            out_f.write(f'{src},{port},{dst}\n')
+        for (src,port,usr,img,dst),(first_seen,last_seen,label) in uq.items(): 
+            out_f.write(f'{first_seen},{last_seen},{src},{port},{usr},{img},{dst},{label}\n')
         out_f.close()
 
     Parallel(n_jobs=64, prefer='processes')(
-        delayed(compress_one)(i) for i in tqdm(range(158))
+        delayed(compress_one)(i) for i in tqdm(range(354))
     )
 
 if __name__ == '__main__':
@@ -482,7 +517,7 @@ if __name__ == '__main__':
         node_map = pickle.load(f)
 
     copy_one(
-        '/home/ead/datasets/OpTC/ecar/benign_gz/17-18Sep19/AIA-51-75.ecar-last.json.gz',
+        f'{RAW_OPTC}/eval_gz/23Sep19/AIA-201-225.ecar-last.json.gz', 
         node_map, Lock(), 0,1
     )
     '''
